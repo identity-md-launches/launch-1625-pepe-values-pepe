@@ -33,7 +33,15 @@ contract PadLiquidity {
     uint64 public constant BURN_INTERVAL = 10 minutes;
     uint256 public constant SELL_CHUNK = 1_000_000 ether; // tokens sold per collection, per pool
     uint256 public constant DEPTH_DIVISOR = 200; // a sale is also capped at 0.5% of the pool's token depth
+    /// @notice Most initialized ticks the graduation swap will cross. More than this in the way (a third party
+    ///         parked positions between the pre-initialized price and the target) and the swap is skipped.
+    uint256 public constant MAX_PATH_TICKS = 32;
     uint256 internal constant PUSH_GAS = 30_000;
+
+    struct Range {
+        int24 lower;
+        int24 upper;
+    }
 
     uint8 internal constant ACT_GRADUATE = 1;
     uint8 internal constant ACT_COLLECT = 2;
@@ -46,6 +54,7 @@ contract PadLiquidity {
     address[] public pools; // graduated tokens, in graduation order
     mapping(address => bool) public graduated;
     mapping(address => bool) public failed;
+    mapping(address => Range[]) internal positions; // the pad's LP positions per graduated token (1 or 2)
     uint256 public distributeCursor;
 
     uint256 public burnBucket;
@@ -55,8 +64,9 @@ contract PadLiquidity {
 
     event KingBound(address king);
     event GraduatedToPool(
-        address indexed token, uint160 targetSqrtPrice, uint160 poolSqrtPrice, uint128 liquidity, bool preInitialized
+        address indexed token, uint160 targetSqrtPrice, uint160 poolSqrtPrice, bool preInitialized, bool split
     );
+    event PositionAdded(address indexed token, int24 tickLower, int24 tickUpper, uint128 liquidity);
     event LiquidityAdded(address indexed token, uint256 ethIn, uint256 tokensIn, uint256 tokensBurned);
     event GraduationFailed(address indexed token, uint256 tokensBurned);
     event BurnDeposited(address indexed from, uint256 amount);
@@ -105,6 +115,21 @@ contract PadLiquidity {
 
     function poolSqrtPrice(address token) external view returns (uint160 sqrtPriceX96) {
         (sqrtPriceX96,,,) = manager.getSlot0(poolKey(token).toId());
+    }
+
+    /// @notice The pad's LP positions for a graduated token: one full-range position, or (when a third party
+    ///         pre-initialized the pool and the price could not be brought to the target) an ETH-only position
+    ///         above the target and a token-only position below the pool price.
+    function positionsOf(address token) external view returns (Range[] memory) {
+        return positions[token];
+    }
+
+    /// @notice Initialized ticks a graduation swap would cross between the pool's price and the target
+    ///         (counting stops at MAX_PATH_TICKS + 1).
+    function pathTicks(address token, uint160 target) external view returns (uint256) {
+        PoolId id = poolKey(token).toId();
+        (uint160 cur,,,) = manager.getSlot0(id);
+        return _initializedTicksBetween(id, cur, target);
     }
 
     function burnDue() public view returns (bool) {
@@ -186,34 +211,109 @@ contract PadLiquidity {
 
     function _graduate(PoolKey memory key, address token, uint160 target, uint256 eth, uint256 tokens) internal {
         bool pre;
+        PoolId id = key.toId();
         // solhint-disable-next-line no-empty-blocks
         try manager.initialize(key, target) {}
         catch {
             pre = true;
-            (uint160 cur,,,) = manager.getSlot0(key.toId());
-            if (cur != target) {
-                // Move the price toward the target with a price limit. The pool key is public, so a third party
-                // may have initialized the pool and parked liquidity between the current price and the target;
-                // the swap then trades with it. Spend only the part of our stock that the full-range position
-                // could not use anyway (see _swapBudget), so the position stays fundable whatever is absorbed.
-                // Through an empty pool the price moves to the target for free.
+            (uint160 cur,,,) = manager.getSlot0(id);
+            // Move the price toward the target with a price limit. The pool key is public, so a third party
+            // may have initialized the pool and parked liquidity between the current price and the target;
+            // the swap then trades with it. Spend only the part of our stock that the full-range position
+            // could not use anyway (see _swapBudget), so the position stays fundable whatever is absorbed.
+            // Through an empty pool the price moves to the target for free. The swap's gas grows with every
+            // initialized tick on the path, which a third party controls, so it is only attempted when at
+            // most MAX_PATH_TICKS are in the way; otherwise the price stays where it is and the positions
+            // below are placed around the target instead.
+            if (cur != target && _initializedTicksBetween(id, cur, target) <= MAX_PATH_TICKS) {
                 (bool zeroForOne, uint256 budget) = _swapBudget(cur, target, eth, tokens);
                 BalanceDelta d = manager.swap(key, SwapParams(zeroForOne, -int256(budget), target), "");
                 eth = uint256(int256(eth) + d.amount0());
                 tokens = uint256(int256(tokens) + d.amount1());
             }
         }
-        (uint160 sqrtP,,,) = manager.getSlot0(key.toId());
-        uint128 liq = _fullRangeLiquidity(sqrtP, eth, tokens);
-        BalanceDelta d2;
-        if (liq != 0) {
-            (d2,) = manager.modifyLiquidity(
-                key, ModifyLiquidityParams(TICK_LOWER, TICK_UPPER, int256(uint256(liq)), bytes32(0)), ""
-            );
-        }
+        (uint160 sqrtP,,,) = manager.getSlot0(id);
+        BalanceDelta d2 = sqrtP == target
+            ? _addPosition(
+                key, token, TICK_LOWER, TICK_UPPER, _liquidityFor(TICK_LOWER, TICK_UPPER, sqrtP, eth, tokens)
+            )
+            : _addSplitPositions(key, token, target, eth, tokens);
         _settleOpen(key);
-        emit GraduatedToPool(token, target, sqrtP, liq, pre);
+        emit GraduatedToPool(token, target, sqrtP, pre, sqrtP != target);
         _finishGraduation(token, d2);
+    }
+
+    /// @dev The price could not be brought to the target. A full-range position here would offer our ETH to
+    ///      token sellers at prices better than the target (ruinous when the pool sits far below it), so
+    ///      instead: all ETH goes in a range strictly above both the pool tick and the target, all tokens in a
+    ///      range at or below both. Neither side ever trades at a price worse for the pad than the target.
+    function _addSplitPositions(PoolKey memory key, address token, uint160 target, uint256 eth, uint256 tokens)
+        internal
+        returns (BalanceDelta d2)
+    {
+        (int24 ethLower, int24 tokUpper) = _splitTicks(key.toId(), target);
+        if (ethLower < TICK_UPPER) {
+            d2 = _addPosition(key, token, ethLower, TICK_UPPER, _liquidityFor(ethLower, TICK_UPPER, 0, eth, 0));
+        }
+        if (tokUpper > TICK_LOWER) d2 = d2 + _addTokenSide(key, token, tokUpper, tokens);
+    }
+
+    function _addTokenSide(PoolKey memory key, address token, int24 tokUpper, uint256 tokens)
+        internal
+        returns (BalanceDelta)
+    {
+        uint160 b = TickMath.getSqrtPriceAtTick(tokUpper);
+        return _addPosition(key, token, TICK_LOWER, tokUpper, _liquidityFor(TICK_LOWER, tokUpper, b, 0, tokens));
+    }
+
+    /// @dev Boundaries of the split positions: the ETH range starts strictly above both the pool tick and the
+    ///      target tick; the token range ends at or below both.
+    function _splitTicks(PoolId id, uint160 target) internal view returns (int24 ethLower, int24 tokUpper) {
+        (, int24 tick,,) = manager.getSlot0(id);
+        int24 tTarget = TickMath.getTickAtSqrtPrice(target);
+        ethLower = _floorTick(tick > tTarget ? tick : tTarget) + TICK_SPACING;
+        tokUpper = _floorTick(tick < tTarget ? tick : tTarget);
+    }
+
+    function _addPosition(PoolKey memory key, address token, int24 lower, int24 upper, uint128 liq)
+        internal
+        returns (BalanceDelta d)
+    {
+        if (liq == 0) return d;
+        (d,) = manager.modifyLiquidity(key, ModifyLiquidityParams(lower, upper, int256(uint256(liq)), bytes32(0)), "");
+        positions[token].push(Range(lower, upper));
+        emit PositionAdded(token, lower, upper, liq);
+    }
+
+    /// @dev Largest multiple of TICK_SPACING at or below `tick`.
+    function _floorTick(int24 tick) internal pure returns (int24 c) {
+        c = tick / TICK_SPACING;
+        if (tick < 0 && tick % TICK_SPACING != 0) c--;
+        return c * TICK_SPACING;
+    }
+
+    /// @dev Number of initialized ticks in the tick bitmap between the two sqrt prices (inclusive on both ends,
+    ///      so it never undercounts what a swap between them would cross). Stops at MAX_PATH_TICKS + 1.
+    function _initializedTicksBetween(PoolId id, uint160 a, uint160 b) internal view returns (uint256 n) {
+        int24 ta = TickMath.getTickAtSqrtPrice(a);
+        int24 tb = TickMath.getTickAtSqrtPrice(b);
+        if (ta > tb) (ta, tb) = (tb, ta);
+        int24 cLo = _floorTick(ta) / TICK_SPACING;
+        int24 cHi = _floorTick(tb) / TICK_SPACING;
+        int16 wLo = int16(cLo >> 8);
+        int16 wHi = int16(cHi >> 8);
+        for (int16 w = wLo; w <= wHi; w++) {
+            uint256 bits = manager.getTickBitmap(id, w);
+            if (w == wLo) bits &= ~((uint256(1) << uint256(int256(cLo) - (int256(w) << 8))) - 1);
+            if (w == wHi) {
+                uint256 top = uint256(int256(cHi) - (int256(w) << 8));
+                if (top < 255) bits &= (uint256(1) << (top + 1)) - 1;
+            }
+            while (bits != 0) {
+                bits &= bits - 1;
+                if (++n > MAX_PATH_TICKS) return n;
+            }
+        }
     }
 
     function _finishGraduation(address token, BalanceDelta d2) internal {
@@ -261,8 +361,13 @@ contract PadLiquidity {
     }
 
     function _collect(PoolKey memory key, address token) internal {
-        (BalanceDelta fees,) =
-            manager.modifyLiquidity(key, ModifyLiquidityParams(TICK_LOWER, TICK_UPPER, 0, bytes32(0)), "");
+        BalanceDelta fees;
+        Range[] storage rs = positions[token];
+        for (uint256 i; i < rs.length; i++) {
+            (BalanceDelta f,) =
+                manager.modifyLiquidity(key, ModifyLiquidityParams(rs[i].lower, rs[i].upper, 0, bytes32(0)), "");
+            fees = fees + f;
+        }
         uint256 fee0 = uint256(int256(fees.amount0()));
         uint256 fee1 = uint256(int256(fees.amount1()));
         uint256 held = IPadToken(token).balanceOf(address(this));
@@ -310,11 +415,16 @@ contract PadLiquidity {
         }
     }
 
-    /// @dev Largest full-range liquidity fundable with the given amounts, with a tiny safety margin for rounding.
-    ///      Returns 0 (no position) instead of reverting when either side cannot fund any liquidity.
-    function _fullRangeLiquidity(uint160 sqrtP, uint256 amount0, uint256 amount1) internal pure returns (uint128) {
-        uint160 lo = TickMath.getSqrtPriceAtTick(TICK_LOWER);
-        uint160 hi = TickMath.getSqrtPriceAtTick(TICK_UPPER);
+    /// @dev Largest liquidity in [lowerTick, upperTick] fundable with the given amounts at price `sqrtP`, with a
+    ///      tiny safety margin for rounding. Returns 0 (no position) instead of reverting when either side
+    ///      cannot fund any liquidity.
+    function _liquidityFor(int24 lowerTick, int24 upperTick, uint160 sqrtP, uint256 amount0, uint256 amount1)
+        internal
+        pure
+        returns (uint128)
+    {
+        uint160 lo = TickMath.getSqrtPriceAtTick(lowerTick);
+        uint160 hi = TickMath.getSqrtPriceAtTick(upperTick);
         uint256 l;
         if (sqrtP <= lo) {
             l = FullMath.mulDiv(amount0, FullMath.mulDiv(lo, hi, FixedPoint96.Q96), hi - lo);

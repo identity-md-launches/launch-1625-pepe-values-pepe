@@ -119,6 +119,40 @@ contract Griefer {
     }
 }
 
+/// @dev Initializes the pool `count + 1` spacings below `from` and parks one liquidity-1 ETH-only position per
+///      spacing from `from` upward: every one of those ticks is then in the way of the graduation swap.
+contract TickSpammer {
+    using TransientStateLibrary for IPoolManager;
+
+    IPoolManager public immutable manager;
+
+    constructor(IPoolManager m) {
+        manager = m;
+    }
+
+    receive() external payable {}
+
+    function initAt(PoolKey memory key, int24 tick) external {
+        manager.initialize(key, TickMath.getSqrtPriceAtTick(tick));
+    }
+
+    function spam(PoolKey memory key, int24 from, uint256 count) external {
+        manager.unlock(abi.encode(key, from, count));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        (PoolKey memory key, int24 from, uint256 count) = abi.decode(data, (PoolKey, int24, uint256));
+        for (uint256 i; i < count; i++) {
+            int24 lo = from + int24(int256(i)) * 200;
+            manager.modifyLiquidity(key, ModifyLiquidityParams(lo, lo + 200, 1, bytes32(0)), "");
+        }
+        int256 d0 = manager.currencyDelta(address(this), key.currency0);
+        require(manager.currencyDelta(address(this), key.currency1) == 0, "token side needed");
+        manager.settle{value: uint256(-d0)}();
+        return "";
+    }
+}
+
 abstract contract Harness is Test {
     address constant ARB = address(0x64);
     address constant OWNER = 0x5b95A971B4583A5f011E9DA082acdD679b870D06;

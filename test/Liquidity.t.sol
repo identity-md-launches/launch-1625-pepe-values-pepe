@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Harness, Swapper, Rejecter, Griefer} from "./Harness.sol";
+import {Harness, Swapper, Rejecter, Griefer, TickSpammer} from "./Harness.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
@@ -130,43 +130,206 @@ contract LiquidityTest is Harness {
         assertGt(parked, 0);
     }
 
+    /// @dev ETH and tokens held by the pad's positions in the pool, from the pool's price and each range.
+    function _padHoldings() internal view returns (uint256 padEth, uint256 padTokens) {
+        PoolKey memory key = liq.poolKey(address(pvp));
+        (uint160 sqrtP,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        PadLiquidity.Range[] memory rs = liq.positionsOf(address(pvp));
+        for (uint256 i; i < rs.length; i++) {
+            (uint128 L,,) = IPoolManager(address(manager))
+                .getPositionInfo(key.toId(), address(liq), rs[i].lower, rs[i].upper, bytes32(0));
+            assertGt(L, 0, "recorded position has liquidity");
+            uint160 lo = TickMath.getSqrtPriceAtTick(rs[i].lower);
+            uint160 hi = TickMath.getSqrtPriceAtTick(rs[i].upper);
+            uint160 a = sqrtP < lo ? lo : (sqrtP > hi ? hi : sqrtP);
+            padEth += FullMath.mulDiv(uint256(L) << 96, hi - a, FullMath.mulDiv(a, hi, 1 << 96));
+            padTokens += FullMath.mulDiv(L, a - lo, 1 << 96);
+        }
+    }
+
     /// @dev Graduation completed with every asset accounted for; returns the tokens the parked liquidity absorbed.
-    function _assertGraduatedWithEverything(uint256 curve, uint256 remaining, uint256 carryAfterFinalize)
-        internal
-        view
-        returns (uint256 sold)
-    {
+    ///      Short of the target the pad holds two single-sided positions: its ETH strictly above the target, its
+    ///      tokens at or below the pool price, so neither side is ever traded at a price worse than the target.
+    function _assertGraduatedWithEverything(
+        uint160 target,
+        uint256 curve,
+        uint256 remaining,
+        uint256 carryAfterFinalize
+    ) internal view returns (uint256 sold) {
         PoolKey memory key = liq.poolKey(address(pvp));
         assertEq(genesis.phase(), genesis.PHASE_GRADUATED());
         assertTrue(pad.pvpDone(), "genesis graduated");
         assertTrue(pvp.unlocked(), "token unlocked");
         assertEq(address(genesis).balance, 0);
-        // PadLiquidity keeps nothing but the burn bucket; its position holds every wei of ETH it had (the curve
+        // PadLiquidity keeps nothing but the burn bucket; its positions hold every wei of ETH it had (the curve
         // ETH plus whatever the parked liquidity paid for the tokens it absorbed) up to the 1e-6 rounding margin
         assertEq(address(liq).balance, liq.burnBucket());
         assertEq(pvp.balanceOf(address(liq)), 0);
-        (uint128 posL,,) =
-            IPoolManager(address(manager)).getPositionInfo(key.toId(), address(liq), -887_200, 887_200, bytes32(0));
-        assertGt(posL, 0, "pad owns a full-range position");
-        (uint160 sqrtP,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
-        uint160 hi = TickMath.getSqrtPriceAtTick(887_200);
-        uint256 padEth = FullMath.mulDiv(uint256(posL) << 96, hi - sqrtP, FullMath.mulDiv(sqrtP, hi, 1 << 96));
-        assertGe(padEth, curve * 999_999 / 1_000_000, "all curve ETH is in the pad's position");
+        (uint160 sqrtP, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        PadLiquidity.Range[] memory rs = liq.positionsOf(address(pvp));
+        if (sqrtP == target) {
+            assertEq(rs.length, 1, "one full-range position");
+            assertEq(rs[0].lower, -887_200);
+            assertEq(rs[0].upper, 887_200);
+        } else {
+            assertLt(sqrtP, target, "short of the target");
+            assertEq(rs.length, 2, "ETH-only and token-only positions");
+            assertGt(rs[0].lower, TickMath.getTickAtSqrtPrice(target), "pad ETH sits strictly above the target");
+            assertGt(rs[0].lower, tick);
+            assertEq(rs[0].upper, 887_200);
+            assertEq(rs[1].lower, -887_200);
+            assertLe(rs[1].upper, tick, "pad tokens sit at or below the pool price");
+        }
+        (uint256 padEth, uint256 padTokens) = _padHoldings();
+        assertGe(padEth, curve * 999_999 / 1_000_000, "all curve ETH is in the pad's positions");
         // the only ETH that left PadLiquidity for the carry pot is the 1e-6 rounding margin of what it pooled
         assertLe(pad.carryPot() - carryAfterFinalize, padEth / 100_000 + 1, "ETH leftover is rounding dust only");
-        // token conservation: in the manager (pad position + parked position) + burned + sold on the curve
+        // token conservation: in the manager (pad positions + parked position) + burned + sold on the curve
         uint256 inManager = pvp.balanceOf(address(manager));
         assertEq(inManager + pvp.balanceOf(DEAD) + genesis.tokensSold(), 1e9 ether);
-        uint256 padTokens = FullMath.mulDiv(posL, sqrtP - TickMath.getSqrtPriceAtTick(-887_200), 1 << 96);
         sold = remaining - padTokens - pvp.balanceOf(DEAD);
         // the swap only ever spends part of the token excess the position could not use anyway
         assertLt(sold, remaining / 2, "at most the spare half of the excess was sold");
-        assertGe(pvp.balanceOf(DEAD), remaining / 10, "a large part of the excess is still burned");
+    }
+
+    /// @dev Plays genesis with two imps (3 rolls each) and returns the pool key and target.
+    function _playGenesis() internal returns (PoolKey memory key, uint160 target) {
+        _open();
+        _mintN(genesis, 2);
+        _toPlay(genesis);
+        for (uint256 r; r < 3; r++) {
+            _roll(genesis, _imp(0));
+            _roll(genesis, _imp(1));
+            arb.advance(5);
+            vm.warp(block.timestamp + 61);
+        }
+        key = liq.poolKey(address(pvp));
+        target = genesis.graduationSqrtPrice();
+    }
+
+    /// @dev Reviewer finding fa4bd5e1: thousands of 1-wei ETH-only positions between a pre-initialized price and
+    ///      the target made the graduation swap cross every tick (63M gas for 2,000). Now the swap is skipped
+    ///      when more than MAX_PATH_TICKS are in the way, graduation costs the same whatever is parked, and the
+    ///      pad's funds go into positions around the target so nobody can drain its ETH at the parked price.
+    struct Spam {
+        PoolKey key;
+        uint160 target;
+        uint160 parkedPrice;
+        uint256 curve;
+        uint256 remaining;
+        uint256 carryAfterFinalize;
+        uint256 gasUsed;
+    }
+
+    /// @dev Plays genesis, parks `count` liquidity-1 ETH-only ticks below the target, finalizes and graduates.
+    function _spamThenGraduate(uint256 count) internal returns (Spam memory s) {
+        (s.key, s.target) = _playGenesis();
+        s.curve = genesis.curveEth();
+        s.remaining = pvp.balanceOf(address(genesis));
+        int24 tTarget = (TickMath.getTickAtSqrtPrice(s.target) / 200) * 200;
+        int24 from = tTarget - int24(int256(count)) * 200;
+        TickSpammer sp = new TickSpammer(IPoolManager(address(manager)));
+        vm.deal(address(sp), 1 ether);
+        sp.initAt(s.key, from - 200);
+        sp.spam(s.key, from, count);
+        assertLt(1 ether - address(sp).balance, count * 10, "a few wei per parked tick");
+        (s.parkedPrice,,,) = IPoolManager(address(manager)).getSlot0(s.key.toId());
+        vm.warp(genesis.endsBy());
+        genesis.poke(); // finalize
+        assertEq(genesis.phase(), genesis.PHASE_PAYING());
+        s.carryAfterFinalize = pad.carryPot();
+        uint256 g0 = gasleft();
+        genesis.poke(); // graduate
+        s.gasUsed = g0 - gasleft();
+    }
+
+    function test_tickSpamCannotMakeGraduationUnaffordable() public {
+        Spam memory s = _spamThenGraduate(600);
+        assertGt(liq.pathTicks(address(pvp), s.target), liq.MAX_PATH_TICKS());
+        assertLt(s.gasUsed, 3_000_000, "graduation fits the 3M upkeep poke, let alone one transaction");
+        uint256 sold = _assertGraduatedWithEverything(s.target, s.curve, s.remaining, s.carryAfterFinalize);
+        assertLe(sold, 1, "the swap was skipped: nothing traded with the parked ticks (1 wei rounding)");
+        (uint160 sqrtP,,,) = IPoolManager(address(manager)).getSlot0(s.key.toId());
+        assertEq(sqrtP, s.parkedPrice, "the pool price was left where the griefer put it");
+        assertTrue(pad.pvpDone());
+        pad.launch("Next", "NXT", "");
+
+        // the drain is closed: a holder selling tokens never gets more than their value at the target price
+        // (plus the few wei the griefer's own positions pay), because the pad's ETH sits above the target
+        address holder = _imp(0);
+        uint256 bal = pvp.balanceOf(holder);
+        Swapper sw = new Swapper(manager);
+        vm.prank(holder);
+        pvp.transfer(address(sw), bal);
+        sw.sell(s.key, bal);
+        uint256 got = address(sw).balance;
+        uint256 fair = FullMath.mulDiv(bal, 1 << 96, FullMath.mulDiv(s.target, s.target, 1 << 96));
+        assertLe(got, fair + 10_000, "no ETH is sold below the target price");
+        assertGt(got, 0, "the holder can still sell");
+        (uint256 padEthAfter,) = _padHoldings();
+        assertGe(padEthAfter + got, s.curve * 999_999 / 1_000_000 - 10_000, "the pad's ETH moved at fair prices");
+    }
+
+    /// @dev Graduation gas does not depend on how many ticks are parked once the swap is skipped.
+    function test_graduationGasIsFlatInParkedTicks() public {
+        Spam memory a = _spamThenGraduate(40);
+        setUp();
+        Spam memory b = _spamThenGraduate(400);
+        assertLt(a.gasUsed, 3_000_000);
+        assertLt(b.gasUsed, 3_000_000);
+        assertApproxEqAbs(b.gasUsed, a.gasUsed, 100_000, "ten times the ticks, same graduation cost");
+    }
+
+    /// @dev A few parked ticks (at most MAX_PATH_TICKS) are crossed as before: the price reaches the target and
+    ///      the pad owns a single full-range position, paid for with a bounded part of its spare tokens.
+    function test_fewParkedTicksAreCrossedToTheTarget() public {
+        (PoolKey memory key, uint160 target) = _playGenesis();
+        uint256 curve = genesis.curveEth();
+        uint256 remaining = pvp.balanceOf(address(genesis));
+        int24 tTarget = (TickMath.getTickAtSqrtPrice(target) / 200) * 200;
+        uint256 count = liq.MAX_PATH_TICKS() - 1; // count + 1 ticks are initialized
+        int24 from = tTarget - int24(int256(count)) * 200;
+        TickSpammer s = new TickSpammer(IPoolManager(address(manager)));
+        vm.deal(address(s), 1 ether);
+        s.initAt(key, from - 200);
+        s.spam(key, from, count);
+        assertLe(liq.pathTicks(address(pvp), target), liq.MAX_PATH_TICKS());
+        vm.warp(genesis.endsBy());
+        genesis.poke();
+        uint256 carryAfterFinalize = pad.carryPot();
+        _settle(genesis);
+        (uint160 sqrtP,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        assertEq(sqrtP, target, "price moved to the target through the parked ticks");
+        uint256 sold = _assertGraduatedWithEverything(target, curve, remaining, carryAfterFinalize);
+        assertGt(sold, 0);
+        assertEq(liq.positionsOf(address(pvp)).length, 1);
+    }
+
+    /// @dev Fees from both split positions are collected and reach the king.
+    function test_splitPositionsStillPayFeesToKing() public {
+        Spam memory s = _spamThenGraduate(50);
+        assertEq(liq.positionsOf(address(pvp)).length, 2, "split positions");
+        address alice = address(0xA11CE);
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        king.takeCrown{value: 0.01 ether}();
+        // sell into the pad's ETH side (fees on the token side), then buy back from it (fees in ETH)
+        Swapper sw = new Swapper(manager);
+        vm.deal(address(sw), 2 ether);
+        uint256 bal = pvp.balanceOf(_imp(0));
+        vm.prank(_imp(0));
+        pvp.transfer(address(sw), bal);
+        sw.sell(s.key, bal);
+        sw.buy(s.key, 0.002 ether);
+        uint256 before = alice.balance;
+        liq.distribute(1);
+        assertGt(alice.balance, before, "king paid from the split positions' fees");
+        assertEq(liq.distributeCursor(), 2);
     }
 
     /// @dev Deep ETH-only liquidity parked below the target used to absorb every token and brick graduation.
     function test_deepParkedEthLiquidityCannotBlockGraduation() public {
-        (, uint256 parked,) = _playThenPark(8e23);
+        (, uint256 parked, uint160 target) = _playThenPark(8e23);
         assertGt(parked, 5 ether);
         uint256 curve = genesis.curveEth();
         uint256 remaining = pvp.balanceOf(address(genesis));
@@ -175,7 +338,7 @@ contract LiquidityTest is Harness {
         assertEq(genesis.phase(), genesis.PHASE_PAYING());
         uint256 carryAfterFinalize = pad.carryPot();
         _settle(genesis);
-        uint256 sold = _assertGraduatedWithEverything(curve, remaining, carryAfterFinalize);
+        uint256 sold = _assertGraduatedWithEverything(target, curve, remaining, carryAfterFinalize);
         assertGt(sold, 0, "the bounded swap did trade with the parked liquidity");
         // what was sold was sold above the graduation price, so the pool is deeper than the curve ETH alone
         assertGt(address(manager).balance, curve + parked / 10);
@@ -211,7 +374,7 @@ contract LiquidityTest is Harness {
         genesis.poke(); // finalize
         uint256 carryAfterFinalize = pad.carryPot();
         _settle(genesis);
-        uint256 sold = _assertGraduatedWithEverything(curve, remaining, carryAfterFinalize);
+        uint256 sold = _assertGraduatedWithEverything(target, curve, remaining, carryAfterFinalize);
         // the parked liquidity could have absorbed 90% of the stock; the pad sold it far less than that
         assertLt(sold, remaining * 9 / 10 / 2);
     }

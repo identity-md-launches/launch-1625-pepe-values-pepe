@@ -70,9 +70,14 @@ never be undone and grants nothing else. There is no pause, upgrade, fee switch,
    target first. That swap spends only the part of the pad's stock the full-range position could not use
    anyway (`PadLiquidity._swapBudget`): through an empty pool the price reaches the target for free; if a
    third party parked liquidity in the way, the swap trades a bounded amount with it (at prices better than
-   the target for the pad), stops where its budget ends, and liquidity is then added at the price reached.
-   Graduation therefore always completes and every wei of curve ETH ends in the pad's position. No ETH
-   raised: all tokens are burned and the launch is marked failed.
+   the target for the pad) and stops where its budget ends. The swap is only attempted when at most 32
+   initialized ticks lie between the pool price and the target (`MAX_PATH_TICKS`, counted from the tick
+   bitmap), so its gas cannot be inflated by parking thousands of dust positions. If the price is at the
+   target afterwards, one full-range position is added; otherwise the pad's ETH goes into a range strictly
+   above the target and its tokens into a range at or below the pool price (`positionsOf(token)` lists them),
+   so neither side is ever traded at a price worse for the pad than the target. Graduation therefore always
+   completes, at a gas cost independent of the pool's state, and every wei of curve ETH ends in the pad's
+   positions. No ETH raised: all tokens are burned and the launch is marked failed.
 
 **Genesis**: launch #1 "Pepes Value Pepes" (PvP) is created by `KingOfThePad`'s constructor and waits for
 its first mint. Other launches revert until PvP has graduated (or failed).
@@ -120,9 +125,13 @@ chunk. Each step is gas-capped and best-effort (a failing step never blocks the 
   IMD launch pool of `LaunchToken` (see below).
 - Finalizing a 200-Imp game sorts in memory and stores up to 100 winners; it is the heaviest call
   (~3M gas worst case) and fits the 3M upkeep cap only when poked directly, which anyone can do.
-- A pool pre-initialized by a third party with liquidity parked in the way may graduate at a price short of
-  the final curve price (the pad will not sell more than its spare tokens to reach it). The pad's funds are
-  all in its position either way; the parked liquidity bought tokens above the graduation price.
+- A pool pre-initialized by a third party with liquidity parked in the way may graduate with its price short
+  of the final curve price (the pad will not sell more than its spare tokens, nor cross more than 32 parked
+  ticks, to reach it). The pad's funds are then split into an ETH-only position above the target and a
+  token-only position at or below the pool price, so they trade only at the target price or better for the
+  pad; the gap in between holds only the third party's liquidity. Burn buys (`burnChunk`) have no price
+  limit, as the brief fixes their size; a third party parking thousands of token-only ticks below the price
+  after graduation can stall them (no funds move) until it withdraws. See docs/AUDIT.md item 7.
 - Rolls should be resolved within the hash window (about 256 L2 blocks); anyone can, and the pad's own
   actions do. A roll that expires costs its roller 4 toward zero. A frontend or keeper calling `poke` keeps
   honest players from ever hitting that.

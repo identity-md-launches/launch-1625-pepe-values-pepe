@@ -1,8 +1,10 @@
 # Test report
 
 Toolchain: forge 1.8.3, solc 0.8.26 (pinned), evm cancun, optimizer 200 runs. Command: `forge test`.
-Result: 58 tests, 58 passed, 0 failed, 0 skipped. `forge build` and `forge fmt --check` pass. The reviewer's
-proof test for the pre-initialized pool (`Proof_80d7c387603e.t.sol`, run from `test/scratch/`) passes as well.
+Result: 62 tests, 62 passed, 0 failed, 0 skipped. `forge build` and `forge fmt --check` pass. The reviewers'
+proof tests for the pre-initialized pool (`Proof_80d7c387603e.t.sol`, amount variant) and for its gas variant
+(`Proof_fa4bd5e14850.t.sol`: 2,000 parked ticks, the graduating poke now costs 799,109 gas), run from
+`test/scratch/`, pass as well.
 
 The Uniswap v4 PoolManager used in tests is the real `v4-core` PoolManager (vendored under `lib/v4-core`,
 commit 46c6834). ArbSys is a local mock etched at 0x64 (`test/Harness.sol: MockArbSys`) whose
@@ -12,9 +14,9 @@ precompile and is only as unpredictable as the sequencer's block hashes (see doc
 ## Deployment floor (test/Deploy.t.sol, 9 tests)
 
 - test_deployGasUnderTarget: five contracts + genesis launch deployed from raw creation code with CREATE:
-  10,135,601 gas measured in the test EVM. Under the 13M target and the 16,777,216 hard limit.
+  10,807,783 gas measured in the test EVM. Under the 13M target and the 16,777,216 hard limit.
 - test_runtimeSizesAndOpcodes: every runtime < 24,576 bytes (PadToken 2,714; PadGame 12,991; PvPPad 9,665;
-  PadLiquidity 12,543; KingOfThePad 3,366) and no DELEGATECALL/CALLCODE/SELFDESTRUCT outside PUSH data.
+  PadLiquidity 15,634; KingOfThePad 3,366) and no DELEGATECALL/CALLCODE/SELFDESTRUCT outside PUSH data.
 - test_bindingsAndGenesis, test_bindingsAreOneShot, test_templatesCannotBeInitialized: constructors bind
   once, genesis launch "Pepes Value Pepes"/PvP exists and waits for its first mint, templates are dead.
 - test_openSwitch, test_ownerOpensEarly: mint/roll/launch/takeCrown revert until openPad(); only the owner
@@ -50,7 +52,7 @@ precompile and is only as unpredictable as the sequencer's block hashes (see doc
 - Batches: 120 Imps, 60 winners paid 25 per call, then graduation.
 - Access: fundPot only pad/king; pokeFrom only pad.
 
-## Liquidity (test/Liquidity.t.sol, 13 tests)
+## Liquidity (test/Liquidity.t.sol, 17 tests)
 
 - Graduation creates the ETH/token pool (fee 10000, spacing 200, no hooks) at the final curve price, full
   range position owned by PadLiquidity, all curve ETH in, excess tokens to dEaD, token unlocked in the tx.
@@ -58,9 +60,19 @@ precompile and is only as unpredictable as the sequencer's block hashes (see doc
   liquidity added.
 - Pre-initialized pool with ETH-only liquidity parked below the target, deep (5.7 ETH, would absorb every
   token) and shallow (0.95 ETH, sized to absorb 90% of the stock): graduation completes, the token unlocks,
-  the gate opens, PadLiquidity keeps only the burn bucket, its position holds all curve ETH, the carry pot
+  the gate opens, PadLiquidity keeps only the burn bucket, its positions hold all curve ETH, the carry pot
   receives at most the 1e-6 rounding margin, token conservation holds, and less than half of the spare tokens
   were sold (test_deepParkedEthLiquidityCannotBlockGraduation, test_shallowParkedEthLiquidityDoesNotDrainTheStock).
+  Short of the target the pad holds an ETH-only position strictly above the target and a token-only position
+  at or below the pool price (asserted in both).
+- Tick spam (reviewer finding fa4bd5e1): 600 liquidity-1 ETH-only positions, one per spacing below the
+  target, for a few thousand wei. The swap is skipped (pathTicks > MAX_PATH_TICKS), the graduating poke costs
+  under 3M gas, the pool price stays where the griefer put it, the gate opens, and a holder selling their whole
+  balance receives at most its value at the target price while the pad's ETH moves only at fair prices
+  (test_tickSpamCannotMakeGraduationUnaffordable). 40 vs 400 parked ticks graduate at the same cost within
+  100k gas (test_graduationGasIsFlatInParkedTicks). 32 parked ticks are crossed, the price reaches the target
+  and one full-range position is created (test_fewParkedTicksAreCrossedToTheTarget). LP fees of split
+  positions are collected and reach the king (test_splitPositionsStillPayFeesToKing).
 - No ETH raised: all tokens burned, launch marked failed, pad gate opens, burn deposits redirect to carry pot.
 - Genesis gating: launch reverts until PvP is done; input length limits; carry pot moves into the new game;
   non-genesis 2% goes to the burn bucket.

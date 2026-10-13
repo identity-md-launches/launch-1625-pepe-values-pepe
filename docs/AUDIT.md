@@ -7,7 +7,8 @@ review before release. Tools run: `forge build`, `forge test` (58 tests), `forge
 calls). Slither, Mythril and fuzz campaigns were not run in this job's time budget.
 
 Revision (second round): an independent review reported eight findings; items 2, 7 and 13 to 18 below record
-what was reproduced and changed. The reviewer's proof test for the pre-initialized pool runs green.
+what was reproduced and changed. The reviewers' proof tests for the pre-initialized pool (amount variant and
+gas variant) run green.
 
 ## Trust and roles
 
@@ -78,8 +79,44 @@ No upgradeability, no proxies except the EIP-1167 clones (whose implementation i
    Tested with the reviewer's deep (8e23 liquidity, 5.7 ETH parked) and shallow (0.95 ETH sized to absorb
    90% of the stock) scenarios: graduation completes, the token unlocks, the gate opens, the pad's position
    holds all curve ETH plus what the parked liquidity paid, and less than half of the spare tokens were sold.
-   Residual: with parked liquidity in the way the pool may open short of the final curve price; the parked
-   party bought tokens above that price, which is their cost, not the pad's.
+   **Gas variant (reviewer finding fa4bd5e1, critical, reproduced, fixed).** The same entry point let a third
+   party decide how much gas graduation costs: Uniswap v4 charges one tick crossing per initialized tick on the
+   swap's path, a liquidity-1 ETH-only position per tick spacing costs about 8 wei, and 2,000 of them between
+   the pre-initialized price and the target made the graduating poke cost 63,094,350 gas (reproduced with the
+   reviewer's proof): above Arbitrum Nitro's 32M per-transaction cap, so the game stayed in PHASE_PAYING, the
+   curve ETH stayed in the clone, the token never unlocked and, for genesis, launches, the king and burns stayed
+   closed. Fixed in `PadLiquidity._graduate`:
+   - before the swap, `_initializedTicksBetween` counts the initialized ticks between the pool price and the
+     target from the tick bitmap (at most 36 words, counting stops at `MAX_PATH_TICKS + 1 = 33`); the swap is
+     attempted only when at most `MAX_PATH_TICKS = 32` are in the way, so it crosses at most 32 ticks and the
+     graduation's gas no longer depends on foreign pool state (measured: the proof's 2,000-tick spam graduates
+     in 799,109 gas; 40 and 400 parked ticks cost the same within 100k; all under the 3M upkeep poke cap);
+   - **a position short of the target is never full-range any more.** Reviewing the fix showed that the accepted
+     residual ("the pool may open short of the final curve price") was itself a drain when the shortfall is
+     large: a full-range position at a price far below the target holds almost only ETH and offers it to token
+     sellers at the parked price, so a roller with a few tokens could take every wei of curve ETH (and parking
+     deep liquidity to exhaust the swap budget costs the griefer only the value of the pad's spare tokens at the
+     target price, less than the curve ETH of a sold-out launch). Now, whenever the pool price is not the
+     target after the (possibly skipped) swap, `_addSplitPositions` places all ETH in a range that starts
+     strictly above both the pool tick and the target tick, and all tokens in a range that ends at or below
+     both. The pad's ETH is then only ever sold to token sellers at the target price or worse for them, and its
+     tokens only at the target price or better for the pad. The pool price itself is left where the third
+     party put it; the gap between it and the target holds only their liquidity, which they may withdraw.
+   - `positionsOf(token)` records the one or two ranges; `_collect` loops over them, so LP fees from split
+     positions reach the king as before (tested); `pathTicks(token, target)` exposes the count.
+   Tested: `test_tickSpamCannotMakeGraduationUnaffordable` (600 parked ticks, swap skipped, graduation under
+   3M gas, gate opens, a holder selling into the pool receives at most the target price for their tokens and
+   the pad's ETH moves only at fair prices), `test_graduationGasIsFlatInParkedTicks`,
+   `test_fewParkedTicksAreCrossedToTheTarget` (32 ticks: crossed, price reaches the target, single full-range
+   position), `test_splitPositionsStillPayFeesToKing`, and the deep/shallow parked-liquidity tests now assert
+   the split layout. Residual: a griefed pool opens with its price at the third party's chosen point and a gap
+   up to the target; trading is still possible on both sides at prices no worse for the pad than the target.
+   The 10-minute burn buy (`burnChunk`) and the chunk sale in `distribute` are the other swaps the pad makes:
+   the sale is bounded by its 1% sqrt-price limit (at most two tick crossings); the burn buy has no price
+   limit because the brief fixes its size (up to 0.02 ETH), so after graduation a third party holding tokens
+   could park thousands of token-only ticks below the price and make a burn buy unaffordable until they
+   withdraw. That stalls burns (the bucket keeps its ETH and upkeep's try/catch ignores the failure) but
+   moves no funds; it is left as documented.
 8. **Token locking.** `PadToken` refuses transfers whose `msg.sender` is not the game or `PadLiquidity`
    until `unlock()` (only `PadLiquidity`) is called inside the graduation tx. Holders cannot trade before the
    pool exists; approvals do not bypass the lock (the check is on `msg.sender`).
