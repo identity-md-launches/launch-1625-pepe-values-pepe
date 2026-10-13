@@ -1,0 +1,48 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Pepe Values Pepe",
+    "symbol": "PVP",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "PadToken",
+      "constructorArgs": []
+    },
+    {
+      "contract": "PadGame",
+      "constructorArgs": []
+    },
+    {
+      "contract": "PvPPad",
+      "constructorArgs": [
+        "$owner",
+        "$contract:PadToken",
+        "$contract:PadGame"
+      ]
+    },
+    {
+      "contract": "PadLiquidity",
+      "constructorArgs": [
+        "$contract:PvPPad",
+        "0x8366a39cc670b4001a1121b8f6a443a643e40951"
+      ]
+    },
+    {
+      "contract": "KingOfThePad",
+      "constructorArgs": [
+        "$contract:PvPPad",
+        "$contract:PadLiquidity"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "PvP Pad on Robinhood Chain (4663): a token launchpad where every launch is a fast Spireth dice game; all payments in ETH. Contracts only; no website in this job. Deploy order and bindings: PadToken (EIP-1167 clone template for launch tokens; no args; the template self-initializes so it can never be used) -> PadGame (clone template: virtual constant-product curve plus the Imp game; no args; self-initialized) -> PvPPad(owner, tokenTemplate, gameTemplate): registry, clone factory, carry pot and the one-way open switch; owner is $owner, whose only power is openPad() (anyone may call it 30 days after deployment); dev payout address is the constant 0x5b95a971b4583a5f011e9da082acdd679b870d06 -> PadLiquidity(pad, poolManager): v4 graduation into native-ETH pools (fee 10000, tickSpacing 200, no hooks) with LP locked forever, fee collection for the king, and the PvP burn bucket; poolManager is the Uniswap v4 PoolManager 0x8366a39cc670b4001a1121b8f6a443a643e40951, which no constructor calls; its constructor binds itself once to PvPPad via setLiquidity() -> KingOfThePad(pad, liquidity): crown auction and LP-fee distribution; its constructor binds to both earlier contracts via setKing() and calls PvPPad.startGenesis(), which creates launch #1 'Pepes Value Pepes' (PvP) as token and game clones. Every user action (mint, roll, launch, takeCrown) reverts until openPad(). No initialization calls are needed after deployment; the whole sequence runs in one transaction under the 16,777,216 gas limit (project test test_deployGasUnderTarget asserts <13M including genesis). Constructors never call ArbSys, the PoolManager or anything outside this manifest. RNG and timing use ArbSys (0x64) at runtime. The launch token LaunchToken ('Pepe Values Pepe', PVP) is the plain fixed-supply ERC-20 the factory distributes; it is separate from the pad's genesis clone token and no pad contract is allocated any of it. The pool fields are the launch policy's: paired with IMD at 0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127, fee 12500, tickSpacing 60; the deployer derives the opening price from the policy's opening market cap. README notes that a legal review is required before public launch."
+}
