@@ -11,7 +11,7 @@ contract PvPPad {
     address public constant DEV = 0x5b95A971B4583A5f011E9DA082acdD679b870D06;
     uint256 public constant OPEN_DELAY = 30 days;
     uint256 public constant MAX_LIVE = 10;
-    uint256 public constant LIVE_SCAN = 64;
+    uint256 public constant LIVE_SCAN = 100;
     uint256 internal constant POKE_GAS = 3_000_000;
     uint256 internal constant DISTRIBUTE_GAS = 1_500_000;
     uint256 internal constant BURN_GAS = 700_000;
@@ -42,8 +42,12 @@ contract PvPPad {
     Launch[] internal launches;
     mapping(address => bool) public isGame;
     mapping(address => uint256) public gameIndex; // game => launch index
-    address[] internal active; // games not yet graduated/failed
+    address[] internal active; // games not yet graduated/failed (launched, whether or not they ever started)
     mapping(address => uint256) internal activeIndex; // 1-based
+    address[] internal started; // games that received their first mint and are not yet finalized
+    mapping(address => uint256) internal startedIndex; // 1-based
+    address[] internal settling; // games finalized and not yet graduated/failed (paying, graduating)
+    mapping(address => uint256) internal settlingIndex; // 1-based
     uint256 public upkeepCursor;
     bool internal upkeepRunning;
 
@@ -68,6 +72,7 @@ contract PvPPad {
     event CarryOut(address indexed game, uint256 amount);
     event Held(address indexed to, uint256 amount);
     event Claimed(address indexed to, uint256 amount);
+    event GameStarted(address indexed game);
     event GameFinalized(address indexed game);
     event GameDone(address indexed game, bool failed);
     event UpkeepPoked(address indexed game, bool ok);
@@ -175,14 +180,31 @@ contract PvPPad {
     }
 
     // ---------------------------------------------------------------- game callbacks
+    /// @notice A game's first mint. Only started games are scanned for the king split and poked by upkeep, so
+    ///         launches that never start cost nothing to anyone but their creator.
+    function onGameStarted() external {
+        if (!isGame[msg.sender]) revert NotGame();
+        if (startedIndex[msg.sender] != 0 || settlingIndex[msg.sender] != 0) return;
+        started.push(msg.sender);
+        startedIndex[msg.sender] = started.length;
+        emit GameStarted(msg.sender);
+    }
+
     function onGameFinalized() external {
         if (!isGame[msg.sender]) revert NotGame();
+        _remove(started, startedIndex, msg.sender);
+        if (settlingIndex[msg.sender] == 0 && activeIndex[msg.sender] != 0) {
+            settling.push(msg.sender);
+            settlingIndex[msg.sender] = settling.length;
+        }
         emit GameFinalized(msg.sender);
     }
 
     function onGameDone(bool failed) external {
         if (!isGame[msg.sender]) revert NotGame();
-        _removeActive(msg.sender);
+        _remove(active, activeIndex, msg.sender);
+        _remove(started, startedIndex, msg.sender);
+        _remove(settling, settlingIndex, msg.sender);
         if (msg.sender == genesisGame && !pvpDone) {
             pvpDone = true;
             pvpFailed = failed;
@@ -191,17 +213,18 @@ contract PvPPad {
         emit GameDone(msg.sender, failed);
     }
 
-    function _removeActive(address game) internal {
-        uint256 idx = activeIndex[game];
+    /// @dev Swap-remove from a list with a 1-based index mapping.
+    function _remove(address[] storage list, mapping(address => uint256) storage index, address game) internal {
+        uint256 idx = index[game];
         if (idx == 0) return;
-        uint256 last = active.length;
+        uint256 last = list.length;
         if (idx != last) {
-            address moved = active[last - 1];
-            active[idx - 1] = moved;
-            activeIndex[moved] = idx;
+            address moved = list[last - 1];
+            list[idx - 1] = moved;
+            index[moved] = idx;
         }
-        active.pop();
-        activeIndex[game] = 0;
+        list.pop();
+        index[game] = 0;
     }
 
     /// @notice ETH for the next launched game's pot. Games, the king and anyone else may add.
@@ -245,17 +268,34 @@ contract PvPPad {
         return active[i];
     }
 
+    function startedCount() external view returns (uint256) {
+        return started.length;
+    }
+
+    function startedGame(uint256 i) external view returns (address) {
+        return started[i];
+    }
+
+    function settlingCount() external view returns (uint256) {
+        return settling.length;
+    }
+
+    function settlingGame(uint256 i) external view returns (address) {
+        return settling[i];
+    }
+
     /// @notice Up to `max` live games (started, not ended), soonest ending first, scanned over the first
-    ///         LIVE_SCAN active games.
+    ///         LIVE_SCAN started-and-not-finalized games. Launches that never received a mint are not scanned.
     function liveGames(uint256 max) external view returns (address[] memory out) {
         if (max > MAX_LIVE) max = MAX_LIVE;
-        uint256 n = active.length;
+        if (max == 0) return out;
+        uint256 n = started.length;
         if (n > LIVE_SCAN) n = LIVE_SCAN;
         address[] memory buf = new address[](max);
         uint64[] memory ends = new uint64[](max);
         uint256 m;
         for (uint256 i; i < n; i++) {
-            IPadGame g = IPadGame(active[i]);
+            IPadGame g = IPadGame(started[i]);
             if (!g.isLive()) continue;
             uint64 e = g.endsBy();
             if (m == max && e >= ends[m - 1]) continue;
@@ -276,7 +316,8 @@ contract PvPPad {
     }
 
     // ---------------------------------------------------------------- upkeep
-    /// @notice Bounded global upkeep: poke one active game round-robin, distribute 2 pools, burn a chunk.
+    /// @notice Bounded global upkeep: poke one started or settling game round-robin (never a launch that has
+    ///         not started: there is nothing to do there), distribute 2 pools, burn a chunk.
     ///         Called by every state-changing action of the system; also callable by anyone.
     function upkeep(address actor) external {
         _upkeep(actor);
@@ -285,9 +326,11 @@ contract PvPPad {
     function _upkeep(address actor) internal {
         if (upkeepRunning) return;
         upkeepRunning = true;
-        uint256 n = active.length;
+        uint256 ns = started.length;
+        uint256 n = ns + settling.length;
         if (n != 0) {
-            address g = active[upkeepCursor % n];
+            uint256 i = upkeepCursor % n;
+            address g = i < ns ? started[i] : settling[i - ns];
             upkeepCursor++;
             if (g != msg.sender) {
                 // solhint-disable-next-line no-empty-blocks

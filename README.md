@@ -24,7 +24,7 @@ Constructor arguments: `PvPPad(owner, PadToken, PadGame)`, `PadLiquidity(PvPPad,
 which is also the immutable `DEV` constant. The PoolManager is `0x8366a39cc670b4001a1121b8f6a443a643e40951`.
 Constructors are nonpayable, never call ArbSys or the PoolManager, and only call earlier contracts of the
 manifest (`setLiquidity`, `setKing`, `startGenesis`), each a one-shot binding. Each runtime is under 24,576
-bytes; the full deployment including the genesis launch measures about 9.7M gas in tests (see docs/TEST-REPORT.md).
+bytes; the full deployment including the genesis launch measures about 10.1M gas in tests (see docs/TEST-REPORT.md).
 
 ### Owner powers
 
@@ -51,16 +51,28 @@ never be undone and grants nothing else. There is no pause, upgrade, fee switch,
 6. **RNG**: a roll stores its ArbSys commit block. The outcome is
    `keccak256(game, imp, nonce, arbBlockHash(c+1), arbBlockHash(c+2), arbBlockHash(c+3))`. Anyone resolves;
    every mint, roll and poke resolves up to 8 oldest pending rolls, and an Imp's roll resolves its previous
-   one. A roll unresolved past the 256-block hash window resolves to 0.
-7. **End**: living Imps are ranked by |height| descending, earlier `heightReachedAt` wins ties. The top
-   `ceil(living/2)` split 80% of the pot with triangular weights (`paid - rank`), the bell ringer gets 20%
-   (no bell: all to ranks; none living: carry pot). The sort is done once in memory (<= 200), payouts go out
-   25 per call. The finalizer gets 0.5% of the pot, at most 0.005 ETH.
+   one. A roll left unresolved past the 256-block hash window has no readable dice any more; it then counts
+   as a penalty of 4 toward zero (`MISSED_PENALTY`, never past 0), so letting a roll expire is never better
+   for the roller than resolving it. (The brief's "= 0" would let a roller keep good dice and drop bad ones:
+   see docs/AUDIT.md item 2.) If the Imp's own roll resolves its previous one and that rings the bell, the
+   new roll is refused: play ended.
+7. **End**: living Imps are ranked by |height| descending, earlier `heightReachedAt` wins ties, where
+   "reached at" is the commit order (queue position) of the roll that produced the height, not the order in
+   which rolls happened to be resolved. The top `ceil(living/2)` split 80% of the pot with triangular weights
+   (`paid - rank`), the bell ringer gets 20% (no bell: all to ranks; none living: carry pot). The sort is done
+   once in memory (<= 200), payouts go out 25 per call. The finalizer gets 0.5% of the pot, at most 0.005 ETH.
+   When the curve sells out mid-roll, that roll pays only for the tokens that were left and the rest of its
+   90% goes to the pot, so the curve ends at exactly 4 ETH.
 8. **Graduation** (permissionless, via `poke`): curve ETH plus the remaining tokens go into a Uniswap v4
    pool (native ETH / token, fee 10000, tickSpacing 200, no hooks) at the final curve price, full range,
    owned forever by `PadLiquidity`. Excess tokens go to `0x…dEaD`, the token unlocks inside the same
-   transaction. If the pool was pre-initialized by someone else, a price-limited swap with the pad's own
-   funds moves it to the target first. No ETH raised: all tokens are burned and the launch is marked failed.
+   transaction. If the pool was pre-initialized by someone else, a price-limited swap moves it toward the
+   target first. That swap spends only the part of the pad's stock the full-range position could not use
+   anyway (`PadLiquidity._swapBudget`): through an empty pool the price reaches the target for free; if a
+   third party parked liquidity in the way, the swap trades a bounded amount with it (at prices better than
+   the target for the pad), stops where its budget ends, and liquidity is then added at the price reached.
+   Graduation therefore always completes and every wei of curve ETH ends in the pad's position. No ETH
+   raised: all tokens are burned and the launch is marked failed.
 
 **Genesis**: launch #1 "Pepes Value Pepes" (PvP) is created by `KingOfThePad`'s constructor and waits for
 its first mint. Other launches revert until PvP has graduated (or failed).
@@ -73,20 +85,25 @@ can exist), burn deposits are redirected to the carry pot instead of being stuck
 >= 110% of the current bid and only after the king held for 1 hour. The old king is refunded in full at once
 (gas-capped push; a failed push is held in `PvPPad` and claimable). The extra (new - old; the whole first bid)
 goes 50% equally to the pots of live games (max 10, soonest ending; none: carry pot), 25% to the burn bucket,
-25% to dev. `distribute(n)` collects LP fees from the next n graduated pools round-robin, sells the token side
-for ETH (1M tokens per pool per call) and sends everything to the current king. `takeCrown` distributes a
-batch of 2 first. Fees reach the king at collection, not per swap.
+25% to dev. "Live games" are scanned among the first 100 games that have received their first mint and are
+not yet finalized (`PvPPad.liveGames`); launches that never started are not scanned, so free launch spam
+cannot hide live games. `distribute(n)` collects LP fees from the next n graduated pools round-robin, sells the
+token side for ETH and sends everything to the current king. Each sale is capped at 1M tokens and at 0.5% of
+the pool's token depth, with a 1% sqrt-price limit, so that sandwiching it costs more in pool fees than it can
+extract; unsold fee tokens wait for the next collection. `takeCrown` distributes a batch of 2 first. Fees reach
+the king at collection, not per swap.
 
-**Upkeep**: every state-changing call runs bounded upkeep: resolve rolls, poke one active game round-robin
-(finalize, pay a batch, graduate), distribute 2 pools, burn a chunk. Each step is gas-capped and best-effort
-(a failing step never blocks the user's action). `PadGame.poke()` and `PvPPad.upkeep()` are public. No
-off-chain keeper is required, but one may call `poke` / `upkeep` to speed things along.
+**Upkeep**: every state-changing call runs bounded upkeep: resolve rolls, poke one started or settling game
+round-robin (finalize, pay a batch, graduate; never a launch that has not started), distribute 2 pools, burn a
+chunk. Each step is gas-capped and best-effort (a failing step never blocks the user's action).
+`PadGame.poke()` and `PvPPad.upkeep()` are public. No off-chain keeper is required, but one may call
+`poke` / `upkeep` to speed things along.
 
 ## Safety design
 
 - ETH pushes are gas-capped (30k); failures are escrowed in `PvPPad.claimable` and pulled with `claim()`.
 - Reentrancy guards on every user entry point; checks-effects-interactions; all loops bounded
-  (8 resolutions, 25 payments, 64 scanned games, 10 funded pots, n pools per distribute).
+  (8 resolutions, 25 payments, 100 scanned games, 10 funded pots, n pools per distribute).
 - Internal accounting (`pot`, `curveEth`, `burnBucket`, `carryPot`, `claimable`); no `transferFrom`.
 - Uniswap v4 is only reached through `PoolManager.unlock` with the pad's own funds; `unlockCallback` only
   accepts the PoolManager.
@@ -103,6 +120,12 @@ off-chain keeper is required, but one may call `poke` / `upkeep` to speed things
   IMD launch pool of `LaunchToken` (see below).
 - Finalizing a 200-Imp game sorts in memory and stores up to 100 winners; it is the heaviest call
   (~3M gas worst case) and fits the 3M upkeep cap only when poked directly, which anyone can do.
+- A pool pre-initialized by a third party with liquidity parked in the way may graduate at a price short of
+  the final curve price (the pad will not sell more than its spare tokens to reach it). The pad's funds are
+  all in its position either way; the parked liquidity bought tokens above the graduation price.
+- Rolls should be resolved within the hash window (about 256 L2 blocks); anyone can, and the pad's own
+  actions do. A roll that expires costs its roller 4 toward zero. A frontend or keeper calling `poke` keeps
+  honest players from ever hitting that.
 
 ## The launch token
 

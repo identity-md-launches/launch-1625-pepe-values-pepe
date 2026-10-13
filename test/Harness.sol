@@ -7,8 +7,9 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {SwapParams} from "v4-core/types/PoolOperation.sol";
+import {SwapParams, ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {TransientStateLibrary} from "v4-core/libraries/TransientStateLibrary.sol";
 import {PadToken} from "../src/PadToken.sol";
 import {PadGame} from "../src/PadGame.sol";
 import {PvPPad} from "../src/PvPPad.sol";
@@ -68,11 +69,52 @@ contract Swapper {
         manager.initialize(key, sqrtP);
     }
 
+    /// @dev Sells `tokens` of the pool's token for ETH (dumps the price).
+    function sell(PoolKey memory key, uint256 tokens) external {
+        manager.unlock(abi.encode(key, tokens, false));
+    }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
-        (PoolKey memory key, uint256 eth,) = abi.decode(data, (PoolKey, uint256, bool));
-        BalanceDelta d = manager.swap(key, SwapParams(true, -int256(eth), TickMath.MIN_SQRT_PRICE + 1), "");
-        manager.settle{value: uint256(-int256(d.amount0()))}();
-        manager.take(key.currency1, address(this), uint256(int256(d.amount1())));
+        (PoolKey memory key, uint256 amount, bool buy_) = abi.decode(data, (PoolKey, uint256, bool));
+        if (buy_) {
+            BalanceDelta d = manager.swap(key, SwapParams(true, -int256(amount), TickMath.MIN_SQRT_PRICE + 1), "");
+            manager.settle{value: uint256(-int256(d.amount0()))}();
+            manager.take(key.currency1, address(this), uint256(int256(d.amount1())));
+        } else {
+            BalanceDelta d = manager.swap(key, SwapParams(false, -int256(amount), TickMath.MAX_SQRT_PRICE - 1), "");
+            manager.sync(key.currency1);
+            PadToken(Currency.unwrap(key.currency1)).transfer(address(manager), uint256(-int256(d.amount1())));
+            manager.settle();
+            manager.take(key.currency0, address(this), uint256(int256(d.amount0())));
+        }
+        return "";
+    }
+}
+
+/// @dev Anyone can do this before graduation: initialize the launch's pool below the graduation price and park
+///      ETH-only liquidity between that price and the target (no token is needed: tokens are locked).
+contract Griefer {
+    using TransientStateLibrary for IPoolManager;
+
+    IPoolManager public immutable manager;
+
+    constructor(IPoolManager m) {
+        manager = m;
+    }
+
+    receive() external payable {}
+
+    function park(PoolKey memory key, int24 lower, int24 upper, int256 liq) external {
+        manager.initialize(key, TickMath.getSqrtPriceAtTick(lower));
+        manager.unlock(abi.encode(key, lower, upper, liq));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        (PoolKey memory key, int24 lower, int24 upper, int256 liq) = abi.decode(data, (PoolKey, int24, int24, int256));
+        manager.modifyLiquidity(key, ModifyLiquidityParams(lower, upper, liq, bytes32(0)), "");
+        int256 d0 = manager.currencyDelta(address(this), key.currency0);
+        require(manager.currencyDelta(address(this), key.currency1) == 0, "token side needed");
+        manager.settle{value: uint256(-d0)}();
         return "";
     }
 }

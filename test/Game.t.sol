@@ -162,7 +162,7 @@ contract GameTest is Harness {
         assertEq(im.heightSeq, 1);
     }
 
-    function test_rngWindowMissedIsZero() public {
+    function test_rngWindowMissedFromZeroStaysZero() public {
         _mintN(genesis, 1);
         _toPlay(genesis);
         _roll(genesis, _imp(0));
@@ -171,6 +171,53 @@ contract GameTest is Harness {
         assertEq(genesis.pendingCount(), 0);
         assertEq(genesis.getImp(_imp(0)).height, 0);
         assertEq(genesis.getImp(_imp(0)).resolvedNonce, 1);
+    }
+
+    /// @dev The reviewer's withholding scenario: the roller resolves good dice and lets bad dice expire. An
+    ///      expired roll now costs MISSED_PENALTY toward zero, so expiring is never better than resolving.
+    function test_withholdingBadRollsNeverHelps() public {
+        _mintN(genesis, 1);
+        _toPlay(genesis);
+        _rollForce(genesis, _imp(0), 4);
+        genesis.poke();
+        assertEq(genesis.getImp(_imp(0)).height, 4);
+        vm.warp(block.timestamp + 61);
+        _rollForce(genesis, _imp(0), -4); // bad die, determined at commit+3, left unresolved
+        arb.advance(260); // past the 256-block window
+        vm.warp(block.timestamp + 65);
+        _rollForce(genesis, _imp(0), 3); // the own roll resolves the previous one: expired
+        assertEq(genesis.getImp(_imp(0)).height, 0, "expired roll moved 4 toward zero, same as the honest -4");
+        genesis.poke();
+        assertEq(genesis.getImp(_imp(0)).height, 3);
+        // generalised: +4, -4(expired), +3, -3(expired), +2, -4(expired): honest sum is -2, |h| = 2
+        int8[3] memory next = [int8(-3), 2, -4];
+        for (uint256 i; i < next.length; i++) {
+            vm.warp(block.timestamp + 61);
+            _rollForce(genesis, _imp(0), next[i]);
+            if (next[i] > 0) genesis.poke();
+            else arb.advance(260);
+        }
+        vm.warp(block.timestamp + 61);
+        _roll(genesis, _imp(0)); // resolves the last expired roll
+        int8 h = genesis.getImp(_imp(0)).height;
+        assertLe(h, 2, "withholding must not beat the dice");
+        assertEq(h, 0); // 4 -> 0 (expired) -> 3 -> 0 (expired) -> 2 -> 0 (expired)
+    }
+
+    function test_missedPenaltyPullsTowardZeroFromBothSidesAndNeverPastIt() public {
+        _mintN(genesis, 2);
+        _toPlay(genesis);
+        _rollForce(genesis, _imp(0), -2);
+        _rollForce(genesis, _imp(1), 4);
+        genesis.poke();
+        assertEq(genesis.getImp(_imp(0)).height, -2);
+        vm.warp(block.timestamp + 61);
+        _roll(genesis, _imp(0));
+        _roll(genesis, _imp(1));
+        arb.advance(300);
+        genesis.poke();
+        assertEq(genesis.getImp(_imp(0)).height, 0, "-2 + penalty stops at 0");
+        assertEq(genesis.getImp(_imp(1)).height, 0, "4 - 4");
     }
 
     function test_resolveBatchOfEightAndOwnRollResolvesPrevious() public {
@@ -241,6 +288,87 @@ contract GameTest is Harness {
         assertEq(genesis.rankPool(), rest - rest * 20 / 100);
         assertEq(genesis.winnerCount(), 1); // ceil(2/2)
         assertEq(genesis.winners(0), _imp(0));
+    }
+
+    /// @dev Two imps whose pending rolls both reach 50: the older commit rings, whoever resolves first. The imp
+    ///      whose own roll() would ring the bell out of order is refused (play ended), and the tie-break follows
+    ///      commit order.
+    function test_bellAndTieBreakFollowCommitOrder() public {
+        _mintN(genesis, 2);
+        _toPlay(genesis);
+        for (uint256 i; i < 12; i++) {
+            _rollForce(genesis, _imp(0), 4);
+            _rollForce(genesis, _imp(1), 4);
+            genesis.poke();
+            vm.warp(block.timestamp + 60);
+        }
+        assertEq(genesis.getImp(_imp(0)).height, 48);
+        assertEq(genesis.getImp(_imp(1)).height, 48);
+        // round 13: A commits first, B three blocks later; both land on +4
+        _roll(genesis, _imp(0));
+        _force(genesis, _imp(0), 13, uint64(arb.n()), 4);
+        arb.advance(3);
+        _roll(genesis, _imp(1));
+        _force(genesis, _imp(1), 13, uint64(arb.n()), 4);
+        arb.advance(4);
+        vm.warp(block.timestamp + 60);
+        uint256 potBefore = genesis.pot();
+        // B tries to jump the queue: its own roll would resolve B's roll first and ring the bell -> refused
+        vm.deal(_imp(1), 1 ether);
+        vm.prank(_imp(1));
+        vm.expectRevert(PadGame.BadPhase.selector);
+        genesis.roll{value: 0.002 ether}();
+        assertEq(genesis.pot(), potBefore);
+        assertEq(genesis.bellRinger(), address(0));
+        genesis.poke(); // resolves in commit order: A rings, B also reaches 50 afterwards
+        assertEq(genesis.bellRinger(), _imp(0));
+        assertEq(genesis.getImp(_imp(0)).height, 50);
+        assertEq(genesis.getImp(_imp(1)).height, 50);
+        assertLt(genesis.getImp(_imp(0)).heightSeq, genesis.getImp(_imp(1)).heightSeq);
+        assertEq(genesis.phase(), genesis.PHASE_PAYING());
+        assertEq(genesis.winners(0), _imp(0), "tie at 50 goes to the earlier commit");
+    }
+
+    /// @dev heightSeq is the commit position even when a later roll is resolved first (own-roll resolution).
+    function test_tieBreakIgnoresResolutionOrder() public {
+        _mintN(genesis, 2);
+        _toPlay(genesis);
+        _roll(genesis, _imp(0)); // A commits first
+        _force(genesis, _imp(0), 1, uint64(arb.n()), 3);
+        arb.advance(3); // B's hash blocks do not overlap A's forced one
+        _roll(genesis, _imp(1)); // B commits later
+        _force(genesis, _imp(1), 1, uint64(arb.n()), 3);
+        arb.advance(4);
+        vm.warp(block.timestamp + 60);
+        _roll(genesis, _imp(1)); // B's own roll resolves B's first roll before the batch reaches A's older one
+        assertEq(genesis.getImp(_imp(1)).height, 3);
+        assertEq(genesis.getImp(_imp(0)).height, 3);
+        assertLt(genesis.getImp(_imp(0)).heightSeq, genesis.getImp(_imp(1)).heightSeq, "A reached 3 first");
+    }
+
+    /// @dev A roll whose own-roll resolution rings the bell is refused: nothing is charged or queued after the end.
+    function test_rollAfterOwnBellIsRefused() public {
+        _mintN(genesis, 1);
+        _toPlay(genesis);
+        for (uint256 i; i < 12; i++) {
+            _rollForce(genesis, _imp(0), 4);
+            genesis.poke();
+            vm.warp(block.timestamp + 60);
+        }
+        _rollForce(genesis, _imp(0), 4); // resolvable but unresolved: would reach 50
+        vm.warp(block.timestamp + 61);
+        uint256 potBefore = genesis.pot();
+        vm.deal(_imp(0), 1 ether);
+        vm.prank(_imp(0));
+        vm.expectRevert(PadGame.BadPhase.selector);
+        genesis.roll{value: 0.002 ether}();
+        assertEq(genesis.pot(), potBefore);
+        assertEq(genesis.endedAt(), 0);
+        assertEq(genesis.getImp(_imp(0)).rolls, 13);
+        genesis.poke();
+        assertEq(genesis.bellRinger(), _imp(0));
+        assertEq(genesis.getImp(_imp(0)).resolvedNonce, 13);
+        assertEq(genesis.pendingCount(), 0);
     }
 
     function test_negativeClampAndBell() public {
@@ -387,6 +515,32 @@ contract GameTest is Harness {
         assertEq(genesis.pot() - potBefore, 0.002 ether); // 90% + 8% + 2% (genesis)
         assertEq(genesis.curveEth(), curveBefore);
         assertEq(pvp.balanceOf(_imp(0)), 0);
+    }
+
+    /// @dev The roll that sells the curve out pays only for the tokens left; the rest of its 90% goes to the pot.
+    function test_soldOutCrossingRollPaysOnlyForWhatIsLeft() public {
+        _mintN(genesis, 1);
+        _toPlay(genesis);
+        uint256 left = 10_000 ether; // tokens still on the curve
+        uint256 vTok = 2e8 ether + left;
+        uint256 vEth = (1e45 + vTok - 1) / vTok; // consistent virtual ETH reserve for that point of the curve
+        stdstore.target(address(genesis)).sig("tokensSold()").checked_write(uint256(8e8 ether) - left);
+        stdstore.target(address(genesis)).sig("curveEth()").checked_write(vEth - 1 ether);
+        vm.deal(address(genesis), address(genesis).balance + vEth - 1 ether);
+        assertGt(genesis.quote(0.0018 ether), left - 1); // 0.0018 ETH would buy more than is left
+        assertEq(genesis.quote(0.0018 ether), left);
+        uint256 potBefore = genesis.pot();
+        _roll(genesis, _imp(0));
+        assertEq(pvp.balanceOf(_imp(0)), left);
+        assertTrue(genesis.curveSoldOut());
+        assertEq(genesis.curveEth(), 4 ether, "the curve ends at exactly 4 ETH");
+        uint256 cost = 5 ether - vEth;
+        assertLt(cost, 0.0018 ether);
+        assertEq(genesis.pot() - potBefore, 0.002 ether - cost, "overpayment went to the pot");
+        assertEq(address(genesis).balance, genesis.pot() + genesis.curveEth());
+        (uint256 e, uint256 t) = genesis.reserves();
+        assertEq(e, 5 ether);
+        assertEq(t, 2e8 ether);
     }
 
     function test_fundPotOnlyPadOrKing() public {

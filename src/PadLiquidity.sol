@@ -32,6 +32,7 @@ contract PadLiquidity {
     uint256 public constant BURN_MAX = 0.02 ether;
     uint64 public constant BURN_INTERVAL = 10 minutes;
     uint256 public constant SELL_CHUNK = 1_000_000 ether; // tokens sold per collection, per pool
+    uint256 public constant DEPTH_DIVISOR = 200; // a sale is also capped at 0.5% of the pool's token depth
     uint256 internal constant PUSH_GAS = 30_000;
 
     uint8 internal constant ACT_GRADUATE = 1;
@@ -191,19 +192,25 @@ contract PadLiquidity {
             pre = true;
             (uint160 cur,,,) = manager.getSlot0(key.toId());
             if (cur != target) {
-                // move the price to the target with a price limit, spending only our own funds
-                bool zeroForOne = cur > target;
-                BalanceDelta d =
-                    manager.swap(key, SwapParams(zeroForOne, zeroForOne ? -int256(eth) : -int256(tokens), target), "");
+                // Move the price toward the target with a price limit. The pool key is public, so a third party
+                // may have initialized the pool and parked liquidity between the current price and the target;
+                // the swap then trades with it. Spend only the part of our stock that the full-range position
+                // could not use anyway (see _swapBudget), so the position stays fundable whatever is absorbed.
+                // Through an empty pool the price moves to the target for free.
+                (bool zeroForOne, uint256 budget) = _swapBudget(cur, target, eth, tokens);
+                BalanceDelta d = manager.swap(key, SwapParams(zeroForOne, -int256(budget), target), "");
                 eth = uint256(int256(eth) + d.amount0());
                 tokens = uint256(int256(tokens) + d.amount1());
             }
         }
         (uint160 sqrtP,,,) = manager.getSlot0(key.toId());
         uint128 liq = _fullRangeLiquidity(sqrtP, eth, tokens);
-        (BalanceDelta d2,) = manager.modifyLiquidity(
-            key, ModifyLiquidityParams(TICK_LOWER, TICK_UPPER, int256(uint256(liq)), bytes32(0)), ""
-        );
+        BalanceDelta d2;
+        if (liq != 0) {
+            (d2,) = manager.modifyLiquidity(
+                key, ModifyLiquidityParams(TICK_LOWER, TICK_UPPER, int256(uint256(liq)), bytes32(0)), ""
+            );
+        }
         _settleOpen(key);
         emit GraduatedToPool(token, target, sqrtP, liq, pre);
         _finishGraduation(token, d2);
@@ -218,6 +225,41 @@ contract PadLiquidity {
         emit LiquidityAdded(token, uint256(-int256(d2.amount0())), uint256(-int256(d2.amount1())), left);
     }
 
+    /// @dev How much of our own stock the pre-initialized-pool swap may spend. Selling X of the side in excess
+    ///      at prices between `cur` and `target` brings in at most X * (worst price on the path) of the other
+    ///      side, which then needs pairing at the target too; X <= excess / (1 + (target/cur)^2) keeps the
+    ///      full-range position fundable with every unit of the scarce side after the swap. At least 1 wei is
+    ///      swapped so that an empty pool still has its price moved to the target (nothing is consumed there).
+    function _swapBudget(uint160 cur, uint160 target, uint256 eth, uint256 tokens)
+        internal
+        pure
+        returns (bool zeroForOne, uint256 budget)
+    {
+        uint160 lo = TickMath.getSqrtPriceAtTick(TICK_LOWER);
+        uint160 hi = TickMath.getSqrtPriceAtTick(TICK_UPPER);
+        if (cur < target) {
+            // token pricier than at the target: we sell tokens for ETH (oneForZero)
+            uint256 l0 = FullMath.mulDiv(eth, FullMath.mulDiv(target, hi, FixedPoint96.Q96), hi - target);
+            uint256 need = FullMath.mulDiv(l0, target - lo, FixedPoint96.Q96) + 1;
+            if (tokens > need) budget = _share(tokens - need, cur, target);
+        } else {
+            // token cheaper than at the target: we buy tokens with ETH (zeroForOne)
+            zeroForOne = true;
+            uint256 l1 = FullMath.mulDiv(tokens, FixedPoint96.Q96, target - lo);
+            uint256 need = FullMath.mulDiv(l1, hi - target, FullMath.mulDiv(target, hi, FixedPoint96.Q96)) + 1;
+            if (eth > need) budget = _share(eth - need, target, cur);
+        }
+        if (budget == 0) budget = 1;
+    }
+
+    /// @dev excess * a^2 / (a^2 + b^2) for sqrt prices a <= b, without overflow (0 when b/a is astronomical).
+    function _share(uint256 excess, uint160 a, uint160 b) internal pure returns (uint256) {
+        uint256 q = FullMath.mulDiv(b, FixedPoint96.Q96, a); // b/a in X96, >= Q96
+        if (q >= 1 << 128) return 0;
+        uint256 r = q * q / FixedPoint96.Q96; // (b/a)^2 in X96
+        return FullMath.mulDiv(excess, FixedPoint96.Q96, FixedPoint96.Q96 + r);
+    }
+
     function _collect(PoolKey memory key, address token) internal {
         (BalanceDelta fees,) =
             manager.modifyLiquidity(key, ModifyLiquidityParams(TICK_LOWER, TICK_UPPER, 0, bytes32(0)), "");
@@ -226,10 +268,20 @@ contract PadLiquidity {
         uint256 held = IPadToken(token).balanceOf(address(this));
         uint256 sell = fee1 + held;
         if (sell > SELL_CHUNK) sell = SELL_CHUNK;
+        // Anyone may trigger this sale, so keep it too small to sandwich: at most 1/DEPTH_DIVISOR of the token
+        // side of the pool's active liquidity, and never past a 1% move of the sqrt price. What is not sold
+        // stays here for the next collection. A sandwich pays the 1% pool fee twice on its own volume, which
+        // exceeds what it can extract from a chunk this small.
+        (uint160 sqrtP,,,) = manager.getSlot0(key.toId());
+        uint256 depth = FullMath.mulDiv(manager.getLiquidity(key.toId()), sqrtP, FixedPoint96.Q96) / DEPTH_DIVISOR;
+        if (sell > depth) sell = depth;
         uint256 out;
         if (sell != 0) {
-            BalanceDelta d = manager.swap(key, SwapParams(false, -int256(sell), TickMath.MAX_SQRT_PRICE - 1), "");
+            uint160 limit = uint160(uint256(sqrtP) + uint256(sqrtP) / 100);
+            if (limit >= TickMath.MAX_SQRT_PRICE) limit = TickMath.MAX_SQRT_PRICE - 1;
+            BalanceDelta d = manager.swap(key, SwapParams(false, -int256(sell), limit), "");
             out = uint256(int256(d.amount0()));
+            sell = uint256(-int256(d.amount1()));
         }
         _settleOpen(key);
         emit FeesCollected(token, fee0, fee1, sell, fee0 + out);
@@ -259,14 +311,23 @@ contract PadLiquidity {
     }
 
     /// @dev Largest full-range liquidity fundable with the given amounts, with a tiny safety margin for rounding.
+    ///      Returns 0 (no position) instead of reverting when either side cannot fund any liquidity.
     function _fullRangeLiquidity(uint160 sqrtP, uint256 amount0, uint256 amount1) internal pure returns (uint128) {
         uint160 lo = TickMath.getSqrtPriceAtTick(TICK_LOWER);
         uint160 hi = TickMath.getSqrtPriceAtTick(TICK_UPPER);
-        uint256 inter = FullMath.mulDiv(sqrtP, hi, FixedPoint96.Q96);
-        uint256 l0 = FullMath.mulDiv(amount0, inter, hi - sqrtP);
-        uint256 l1 = FullMath.mulDiv(amount1, FixedPoint96.Q96, sqrtP - lo);
-        uint256 l = l0 < l1 ? l0 : l1;
+        uint256 l;
+        if (sqrtP <= lo) {
+            l = FullMath.mulDiv(amount0, FullMath.mulDiv(lo, hi, FixedPoint96.Q96), hi - lo);
+        } else if (sqrtP >= hi) {
+            l = FullMath.mulDiv(amount1, FixedPoint96.Q96, hi - lo);
+        } else {
+            uint256 l0 = FullMath.mulDiv(amount0, FullMath.mulDiv(sqrtP, hi, FixedPoint96.Q96), hi - sqrtP);
+            uint256 l1 = FullMath.mulDiv(amount1, FixedPoint96.Q96, sqrtP - lo);
+            l = l0 < l1 ? l0 : l1;
+        }
+        if (l <= 1) return 0;
         l = l - l / 1_000_000 - 1;
+        if (l > type(uint128).max) l = type(uint128).max;
         return uint128(l);
     }
 }

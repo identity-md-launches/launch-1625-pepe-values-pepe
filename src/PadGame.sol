@@ -23,6 +23,7 @@ contract PadGame {
     uint64 public constant COOLDOWN = 60 seconds;
     uint256 public constant MAX_IMPS = 200;
     int8 public constant MAX_HEIGHT = 50;
+    int8 public constant MISSED_PENALTY = 4; // a roll unresolved past the hash window moves |height| down by this
     uint256 public constant RESOLVE_BATCH = 8;
     uint256 public constant PAY_BATCH = 25;
     uint256 public constant HASH_WINDOW = 256;
@@ -61,7 +62,6 @@ contract PadGame {
     uint64 public firstMintAt;
     uint64 public endedAt;
     uint64 public maxLastRollAt;
-    uint32 internal seq;
     bool internal locked;
 
     uint256 public pot;
@@ -153,6 +153,7 @@ contract PadGame {
             firstMintAt = uint64(block.timestamp);
             maxLastRollAt = firstMintAt + SIGNUP_SECONDS;
             emit SignupStarted(firstMintAt, firstMintAt + SIGNUP_SECONDS, firstMintAt + GAME_SECONDS);
+            pad.onGameStarted();
         } else if (block.timestamp >= firstMintAt + SIGNUP_SECONDS) {
             revert BadPhase();
         }
@@ -177,10 +178,11 @@ contract PadGame {
         if (!imp.exists) revert NotImp();
         if (block.timestamp > imp.lastRollAt + DEATH_SECONDS) revert Dead();
         if (imp.rolls != 0 && block.timestamp < imp.lastRollAt + COOLDOWN) revert Cooldown();
-        // an Imp's roll resolves its previous one
+        // an Imp's roll resolves its previous one; if that resolution rings the bell, play is over
         if (imp.resolvedNonce != imp.rolls) {
             _resolveImp(msg.sender);
             if (imp.resolvedNonce != imp.rolls) revert Unresolved();
+            if (endedAt != 0) revert BadPhase();
         }
         imp.rolls += 1;
         imp.lastRollAt = uint64(block.timestamp);
@@ -191,8 +193,12 @@ contract PadGame {
         uint256 toPot = msg.value - toCurve - toBurn;
         uint256 out;
         if (tokensSold < CURVE_SUPPLY) {
-            out = _buy(toCurve);
-            curveEth += toCurve;
+            // the roll that sells the curve out pays only for what was left; the rest goes to the pot
+            uint256 cost;
+            (out, cost) = _buy(toCurve);
+            curveEth += cost;
+            toPot += toCurve - cost;
+            toCurve = cost;
         } else {
             toPot += toCurve;
             toCurve = 0;
@@ -296,12 +302,18 @@ contract PadGame {
     }
 
     // ---------------------------------------------------------------- internals
-    function _buy(uint256 ethIn) internal returns (uint256 out) {
+    /// @dev Buys with `ethIn`; when that would overshoot the curve, buys exactly what is left and returns its cost.
+    function _buy(uint256 ethIn) internal returns (uint256 out, uint256 cost) {
         (uint256 vEth, uint256 vTok) = reserves();
         uint256 newTok = (K + vEth + ethIn - 1) / (vEth + ethIn); // round the reserve up: buyer never overpaid by rounding
         out = vTok - newTok;
+        cost = ethIn;
         uint256 left = CURVE_SUPPLY - tokensSold;
-        if (out > left) out = left;
+        if (out > left) {
+            out = left;
+            newTok = vTok - left;
+            cost = (K + newTok - 1) / newTok - vEth; // ETH that moves the reserve exactly to the curve's end
+        }
         tokensSold += out;
     }
 
@@ -357,6 +369,13 @@ contract PadGame {
                 )
             ) % 8;
             delta = r < 4 ? -int8(int256(4 - r)) : int8(int256(r - 3));
+        } else {
+            // The outcome is public from block c+4 and anyone may resolve it, so a roll left unresolved past
+            // the hash window must never be better for the roller than any die: it moves |height| down by
+            // MISSED_PENALTY (not past 0). Expiring a roll is therefore never preferable to resolving it.
+            int8 h0 = imp.height;
+            if (h0 > 0) delta = h0 > MISSED_PENALTY ? -MISSED_PENALTY : -h0;
+            else if (h0 < 0) delta = -h0 > MISSED_PENALTY ? MISSED_PENALTY : -h0;
         }
         imp.resolvedNonce = p.nonce;
         int8 h = imp.height + delta;
@@ -364,7 +383,8 @@ contract PadGame {
         if (h < -MAX_HEIGHT) h = -MAX_HEIGHT;
         if (h != imp.height) {
             imp.height = h;
-            imp.heightSeq = ++seq;
+            // tie-break by commit order (queue position), not by who resolved first
+            imp.heightSeq = uint32(idx + 1);
         }
         emit RollResolved(p.imp, p.nonce, delta, h, missed);
         if ((h == MAX_HEIGHT || h == -MAX_HEIGHT) && endedAt == 0 && _dueEnd() == 0) {
@@ -394,7 +414,8 @@ contract PadGame {
         }
     }
 
-    /// @dev Living imps ranked by |height| desc, earlier heightReachedAt first (insertion sort, <=200 in memory).
+    /// @dev Living imps ranked by |height| desc, earlier heightReachedAt (commit order of the roll that set the
+    ///      height) first; insertion sort, <=200 in memory.
     function _rankLiving(uint64 end) internal view returns (address[] memory living, uint256 m) {
         uint256 n = impList.length;
         living = new address[](n);

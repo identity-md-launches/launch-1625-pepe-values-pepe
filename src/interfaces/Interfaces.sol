@@ -41,6 +41,7 @@ interface IPvPPad {
     function liquidity() external view returns (address);
     function holdFor(address to) external payable;
     function addCarry() external payable;
+    function onGameStarted() external;
     function onGameFinalized() external;
     function onGameDone(bool failed) external;
     function liveGames(uint256 max) external view returns (address[] memory);

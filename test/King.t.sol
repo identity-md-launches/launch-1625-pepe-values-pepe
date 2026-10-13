@@ -132,6 +132,76 @@ contract KingTest is Harness {
         assertEq(live[9], games[3]);
     }
 
+    /// @dev Free launches that never start are not scanned: they cannot hide live games from the king split nor
+    ///      receive upkeep pokes.
+    function test_launchSpamDoesNotHideLiveGamesOrStarveUpkeep() public {
+        _graduateGenesis();
+        address spammer = address(0x5BAD);
+        for (uint256 i; i < 64; i++) {
+            vm.prank(spammer);
+            pad.launch("spam", "SPAM", "");
+        }
+        (, address g) = pad.launch("Honest", "HON", "");
+        vm.prank(_imp(1));
+        PadGame(g).mint();
+        assertEq(pad.activeCount(), 65);
+        assertEq(pad.startedCount(), 1);
+        assertEq(pad.startedGame(0), g);
+        address[] memory live = pad.liveGames(10);
+        assertEq(live.length, 1);
+        assertEq(live[0], g);
+        uint256 p = PadGame(g).pot();
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        king.takeCrown{value: 0.02 ether}();
+        assertEq(PadGame(g).pot() - p, 0.01 ether, "live game gets the 50%");
+        assertEq(pad.carryPot(), 0);
+        // upkeep pokes the started game, never the 64 waiting ones: the due game is finalized by a stranger's call
+        _toPlay(PadGame(g));
+        _roll(PadGame(g), _imp(1));
+        arb.advance(5);
+        vm.warp(PadGame(g).endsBy());
+        pad.upkeep(address(this));
+        assertEq(PadGame(g).phase(), PadGame(g).PHASE_PAYING());
+        assertEq(pad.startedCount(), 0);
+        assertEq(pad.settlingCount(), 1);
+        assertEq(pad.settlingGame(0), g);
+        pad.upkeep(address(this)); // pays the single winner
+        pad.upkeep(address(this)); // graduates
+        assertEq(PadGame(g).phase(), PadGame(g).PHASE_GRADUATED());
+        assertEq(pad.settlingCount(), 0);
+        assertEq(pad.activeCount(), 64);
+    }
+
+    function test_liveGamesZeroReturnsEmpty() public {
+        _graduateGenesis();
+        (, address g) = pad.launch("One", "ONE", "");
+        vm.prank(_imp(1));
+        PadGame(g).mint();
+        assertTrue(PadGame(g).isLive());
+        assertEq(pad.liveGames(0).length, 0);
+        assertEq(pad.liveGames(1).length, 1);
+    }
+
+    function test_endedGamesLeaveTheLiveScan() public {
+        _graduateGenesis();
+        (, address g1) = pad.launch("One", "ONE", "");
+        (, address g2) = pad.launch("Two", "TWO", "");
+        vm.prank(_imp(1));
+        PadGame(g1).mint();
+        vm.warp(block.timestamp + 15 minutes);
+        vm.prank(_imp(2));
+        PadGame(g2).mint();
+        vm.warp(PadGame(g1).playStart() + 10 minutes + 1); // g1: everyone dead, ended but not yet finalized
+        assertFalse(PadGame(g1).isLive());
+        address[] memory live = pad.liveGames(10);
+        assertEq(live.length, 1);
+        assertEq(live[0], g2);
+        PadGame(g1).poke(); // finalize: leaves the started list
+        assertEq(pad.startedCount(), 1);
+        assertEq(pad.startedGame(0), g2);
+    }
+
     function test_takeCrownDistributesFirst() public {
         _graduateGenesis();
         vm.deal(alice, 1 ether);
