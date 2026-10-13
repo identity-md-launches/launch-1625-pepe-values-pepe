@@ -120,7 +120,7 @@ contract RulesTest is Harness {
         genesis.poke(); // pays the single winner (ceil(2/2) = 1)
         // the pool is created inside the graduation call, so PadLiquidity's event precedes the game's
         vm.expectEmit(true, false, false, false, address(liq));
-        emit PadLiquidity.GraduatedToPool(address(pvp), 0, 0, 0, false);
+        emit PadLiquidity.GraduatedToPool(address(pvp), 0, 0, false, false);
         vm.expectEmit(false, false, false, false, address(genesis));
         emit PadGame.Graduated(0, 0, 0);
         vm.expectEmit(true, false, false, true, address(pad));
